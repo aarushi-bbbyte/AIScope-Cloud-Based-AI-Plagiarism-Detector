@@ -1,19 +1,34 @@
-# ◈ AIScope — Cloud-Based AI Plagiarism Detector
+# ◈ AIScope — Cloud-Based AI Content & Plagiarism Detector
 
-A full-stack AI content detection tool that analyses text, PDFs, and DOCX files for AI-generated content using HuggingFace's `roberta-base-openai-detector` model, deployed serverlessly on AWS.
+A full-stack document analysis tool with two modes: **AI Content Detection** (is this text AI-generated?) and **Plagiarism Detection** (are these two documents copied from each other?). Built with React + Vite on the frontend and deployed serverlessly on AWS.
 
 ---
 
 ## Features
 
-- **AI detection** via `roberta-base-openai-detector` (125M param RoBERTa, fine-tuned on GPT-2/GPT-3 outputs)
-- **File upload support** — paste text, or upload PDF, DOCX, or TXT files (text extracted client-side, no file stored)
-- **Version history** — every submission is saved per browser session, with AI% and timestamp shown in a sidebar
-- **Document preview** — see the first 300 characters of each analysed document when browsing history
-- **Version labels** — optionally tag each submission (e.g. "Draft 2", "Final")
-- **Chunked inference** — long documents are split into 512-char chunks, scored individually, then averaged
-- **Confidence scoring** — `confidence = |score − 0.5| × 2` gives a clear high/medium/low certainty signal
-- **Fully serverless** — no servers to manage, scales to zero when idle
+### 🔍 AI Detection
+- Detects AI-generated text via `roberta-base-openai-detector` (125M param RoBERTa, fine-tuned on GPT-2/GPT-3 outputs)
+- Paste text or upload **PDF, DOCX, or TXT** files — text extracted client-side, only plain text sent to backend
+- **Version history sidebar** — every submission saved per browser session with AI%, timestamp, and document preview
+- **Version labels** — tag submissions (e.g. "Draft 2", "Final") for easy comparison
+- **Chunked inference** — documents split into 512-char chunks, scored individually, then averaged
+- **Confidence scoring** — `confidence = |score − 0.5| × 2` with high / medium / low certainty labels
+- Per-chunk score bar chart in the results view
+
+### 📄 Plagiarism Check
+- Compare **two documents** against each other for copied content
+- Upload PDF, DOCX, or TXT for either document, or paste text directly
+- **Sentence-level matching** — Jaccard trigram similarity finds near-identical passages
+- **TF-IDF cosine similarity** — overall document-level vocabulary overlap score
+- **Colour-coded highlights** — matching passages highlighted in both documents simultaneously, hover a match to locate it
+- Overall similarity %, sentence coverage %, and match count
+- Verdict: High plagiarism / Significant overlap / Some similarity / Minor / Original
+
+### ☁️ Infrastructure
+- Fully serverless — scales to zero when idle, no servers to manage
+- Asynchronous AI detection via SQS queue — frontend polls for results
+- Plagiarism check is synchronous — pure Python stdlib, no ML model, instant response
+- `deploy.py` is fully idempotent — safe to run multiple times, never creates duplicate APIs
 
 ---
 
@@ -22,32 +37,37 @@ A full-stack AI content detection tool that analyses text, PDFs, and DOCX files 
 ```
 Browser (React + Vite)
     │
-    │  POST /analyze  { text, filename, file_type, session_id }
-    ▼
-API Gateway (HTTP API)
-    │
-    ├──▶ Lambda: upload_handler
-    │       • Saves text to S3
-    │       • Writes initial job record to DynamoDB
-    │       • Enqueues job_id to SQS
-    │       • Returns job_id immediately
-    │
-    ├──▶ Lambda: results_handler
-    │       • GET /results/{job_id}   → single result
-    │       • GET /history/{session_id} → all jobs for session
-    │
-    └──▶ SQS Queue
-            │
-            ▼
-        Lambda: nlp_worker (triggered by SQS)
-            • Reads text from S3
-            • Chunks text (512 chars, max 20 chunks)
-            • Calls HuggingFace Inference API per chunk
-            • Averages scores, computes confidence
-            • Writes completed result to DynamoDB
+    ├── POST /analyze  ─────────────────────────────────────────────┐
+    ├── GET  /results/{job_id}                                       │
+    ├── GET  /history/{session_id}                                   │
+    └── POST /plagiarism                                             │
+                                                                     ▼
+                                                        API Gateway (HTTP API)
+                                                                     │
+                                    ┌────────────────────────────────┤
+                                    │                                │
+                              upload_handler                  plagiarism_checker
+                              • Saves text to S3              • Sentence-level Jaccard
+                              • Writes job to DynamoDB          trigram matching
+                              • Enqueues to SQS               • TF-IDF cosine similarity
+                              • Returns job_id                • Returns highlights + score
+                                    │
+                              results_handler
+                              • GET /results/{job_id}
+                              • GET /history/{session_id}
+                                    │
+                                 SQS Queue
+                                    │
+                                    ▼
+                               nlp_worker (SQS trigger)
+                               • Reads text from S3
+                               • Chunks into 512-char segments
+                               • Calls HuggingFace Inference API
+                               • Averages scores → confidence
+                               • Writes result to DynamoDB
 ```
 
-**AWS services used:** S3 · SQS · Lambda · API Gateway · DynamoDB · IAM
+**AWS services:** S3 · SQS · Lambda · API Gateway · DynamoDB · IAM
 
 ---
 
@@ -56,23 +76,26 @@ API Gateway (HTTP API)
 ```
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx          # Main React app
-│   │   ├── App.css          # Base styles
-│   │   └── main.jsx         # Entry point
-│   ├── .env.example         # Environment variable template
+│   │   ├── App.jsx                # Main app — tab switcher, AI detection flow, history sidebar
+│   │   ├── PlagiarismChecker.jsx  # Plagiarism tab — two-doc upload, highlights, match list
+│   │   ├── App.css                # Styles
+│   │   └── main.jsx               # Entry point
+│   ├── .env.example
 │   ├── package.json
 │   └── vite.config.js
 │
 ├── lambdas/
 │   ├── upload_handler/
-│   │   └── handler.py       # POST /analyze
+│   │   └── handler.py       # POST /analyze — saves to S3, enqueues to SQS
 │   ├── results_handler/
-│   │   └── handler.py       # GET /results, GET /history
-│   └── nlp_worker/
-│       └── handler.py       # SQS consumer, HF inference
+│   │   └── handler.py       # GET /results/{job_id}, GET /history/{session_id}
+│   ├── nlp_worker/
+│   │   └── handler.py       # SQS consumer — HuggingFace inference
+│   └── plagiarism_checker/
+│       └── handler.py       # POST /plagiarism — sentence matching + cosine similarity
 │
-├── setup_aws.py             # Run once — creates all AWS resources
-├── deploy.py                # Deploys / updates all Lambdas + API Gateway
+├── setup_aws.py             # Run once — creates S3, SQS, DynamoDB, IAM role
+├── deploy.py                # Idempotent deploy — updates Lambdas + API Gateway
 └── README.md
 ```
 
@@ -94,7 +117,7 @@ pip install boto3
 python setup_aws.py
 ```
 
-This creates the S3 bucket, SQS queue, DynamoDB table, and IAM role. Copy the printed output — you'll need it in the next step.
+Creates the S3 bucket, SQS queue, DynamoDB table, and IAM role. Copy the printed output for the next step.
 
 ### 2. Set environment variables
 
@@ -120,20 +143,20 @@ export LAMBDA_ROLE_ARN="arn:aws:iam::YOUR_ACCOUNT:role/plagiarism-lambda-role"
 export HF_TOKEN="hf_your_token_here"
 ```
 
-### 3. Deploy Lambdas + API Gateway
+### 3. Deploy all Lambdas + API Gateway
 
 ```bash
 python deploy.py
 ```
 
-Copy the printed `VITE_API_BASE_URL` value for the next step.
+Safe to run multiple times — finds the existing API by name and patches it, never creates duplicates. Copy the printed `VITE_API_BASE_URL` for the next step.
 
 ### 4. Configure and run the frontend
 
 ```bash
 cd frontend
 cp .env.example .env
-# Edit .env and set VITE_API_BASE_URL to the value from deploy.py output
+# Set VITE_API_BASE_URL in .env to the value printed by deploy.py
 
 npm install
 npm run dev
@@ -147,7 +170,7 @@ npm run dev
 
 | Variable | Description |
 |---|---|
-| `VITE_API_BASE_URL` | API Gateway endpoint from `deploy.py` output |
+| `VITE_API_BASE_URL` | API Gateway endpoint printed by `deploy.py` |
 
 ### Backend (set before running `deploy.py`)
 
@@ -163,14 +186,13 @@ npm run dev
 
 ---
 
-## How Detection Works
+## How AI Detection Works
 
-1. Text is split into **512-character chunks** (max 20 chunks per document)
-2. Each chunk is sent to the HuggingFace Inference API (`roberta-base-openai-detector`)
-3. The model returns a probability score per chunk (`FAKE` = AI, `REAL` = human)
-4. Chunk scores are **averaged** to produce a final score (0–1)
-5. **Confidence** is derived as `|score − 0.5| × 2` — how far from the uncertain midpoint
-6. Labels are assigned:
+1. Text split into **512-character chunks** (max 20 per document)
+2. Each chunk sent to HuggingFace Inference API (`roberta-base-openai-detector`)
+3. Model returns probability per chunk — `FAKE` = AI, `REAL` = human
+4. Chunk scores **averaged** → final score (0–1)
+5. Confidence = `|score − 0.5| × 2`
 
 | Score | Confidence | Label |
 |---|---|---|
@@ -182,13 +204,32 @@ npm run dev
 
 ---
 
-## Re-deploying After Changes
+## How Plagiarism Detection Works
 
-Just run `deploy.py` again with the same env vars — it updates all three Lambdas in place and adds any missing API Gateway routes without recreating anything.
+1. Both documents split into sentences (min 6 words each)
+2. Every sentence in Doc 1 compared to every sentence in Doc 2 using **Jaccard trigram similarity**
+3. Pairs above 0.5 similarity threshold flagged as matches (greedy, no double-matching)
+4. **TF-IDF cosine similarity** computed at document level for vocabulary overlap
+5. Final similarity % = blend of sentence coverage + cosine similarity
+6. Character offsets computed for each match → rendered as coloured highlights in the UI
+
+| Similarity | Verdict |
+|---|---|
+| ≥ 75% | High plagiarism detected |
+| ≥ 50% | Significant overlap found |
+| ≥ 25% | Some similarity detected |
+| ≥ 10% | Minor similarity |
+| < 10% | Documents appear original |
+
+---
+
+## Re-deploying After Changes
 
 ```bash
 python deploy.py
 ```
+
+Updates all 4 Lambdas in place, idempotently adds any missing routes, refreshes CORS, and redeploys the stage. Your `.env` never needs to change.
 
 ---
 
@@ -196,17 +237,20 @@ python deploy.py
 
 Effectively **$0** for personal/academic use:
 
-- HuggingFace Inference API — free tier
-- AWS Lambda — 1M free requests/month
-- AWS SQS — 1M free requests/month
-- AWS DynamoDB — 25GB free tier
-- AWS S3 — 5GB free tier
+| Service | Free tier |
+|---|---|
+| HuggingFace Inference API | Free |
+| AWS Lambda | 1M requests/month |
+| AWS SQS | 1M requests/month |
+| AWS DynamoDB | 25 GB storage |
+| AWS S3 | 5 GB storage |
 
 ---
 
 ## Notes
 
-- First analysis after a cold start may take ~60 seconds while the HuggingFace model loads. Subsequent runs are fast.
-- Results are stored in DynamoDB with a **7-day TTL** and then automatically deleted.
-- Version history is scoped to the browser session (stored in `localStorage`). Clearing browser data resets it.
-- PDF and DOCX text extraction happens entirely **client-side** — only the extracted plain text is sent to the backend.
+- First AI detection after a cold start may take ~60s while the HuggingFace model loads. Subsequent runs are fast.
+- AI detection results stored in DynamoDB with a **7-day TTL**, then auto-deleted.
+- Plagiarism results are **not stored** — computed on demand and returned directly.
+- Version history is scoped to the browser session via `localStorage`. Clearing browser data resets it.
+- PDF and DOCX text extraction is entirely **client-side** (PDF.js + mammoth.js loaded from CDN) — only plain text is sent to the backend, no file upload costs.
